@@ -183,6 +183,72 @@ def ai_coach():
     except Exception:
         app.logger.exception('AI coach request failed'); return jsonify(error='Could not reach the AI service. Please try again.'),502
 
+
+@app.post('/api/auto-plan')
+@login_required
+def auto_plan():
+    """Create Learn / Practice / Revise tasks for every chapter supplied for one selected level."""
+    data=request.get_json(silent=True) or {}
+    level=str(data.get('level',''))[:80]
+    chapters=data.get('chapters',[])
+    if not isinstance(chapters,list) or not chapters or len(chapters)>500:
+        return jsonify(error='Choose a syllabus level with chapters first.'),400
+    created=0; skipped=0
+    existing_titles={x.title for x in StudyItem.query.filter_by(user_id=current_user().id,kind='task').all()}
+    actions=[('Learn','Read the chapter and write a short summary.'),('Practice','Solve examples and practice questions.')]+([] if str(data.get('mode','3'))=='2' else [('Revise','Recall key ideas and review mistakes.')])
+    for index,entry in enumerate(chapters):
+        if not isinstance(entry,dict): continue
+        subject=str(entry.get('subject','General'))[:100]
+        chapter=str(entry.get('chapter','')).strip()[:180]
+        if not chapter: continue
+        for action,description in actions:
+            title=f'{action}: {level} · {subject} · {chapter}'[:220]
+            if title in existing_titles:
+                skipped+=1; continue
+            due_day=index+1
+            item=StudyItem(user_id=current_user().id,kind='task',title=title,content=f'Automatically planned for study day {due_day}. {description}',subject=subject,status='not_started')
+            db.session.add(item); existing_titles.add(title); created+=1
+    db.session.commit()
+    return jsonify(ok=True,created=created,skipped=skipped,level=level)
+
+@app.post('/api/generate-quiz')
+@login_required
+def generate_quiz():
+    data=request.get_json(silent=True) or {}
+    level=str(data.get('level','')).strip()[:80]
+    subject=str(data.get('subject','')).strip()[:100]
+    chapter=str(data.get('chapter','')).strip()[:180]
+    if not level or not subject or not chapter:
+        return jsonify(error='Choose a class, subject and chapter.'),400
+    key=os.environ.get('OPENAI_API_KEY')
+    if not key:
+        return jsonify(error='Automatic chapter-specific questions need an AI API key. Add OPENAI_API_KEY in Render → Environment; your ChatGPT subscription does not automatically include API credits.'),503
+    prompt=f"""Create exactly 15 high-quality, chapter-specific multiple-choice questions for a student studying {level} (CBSE where applicable). Subject: {subject}. Chapter: {chapter}. Questions must test this chapter specifically, not general subject trivia. Match the level and curriculum. Include a reasonable mix of easy, medium and challenging questions. Each question must have exactly four distinct options, exactly one correct answer, and a concise explanation. Avoid ambiguous or duplicate questions. For Maths/Physics/Chemistry, verify calculations carefully. Return ONLY valid JSON in this shape: {{"questions":[{{"question":"...","options":["A...","B...","C...","D..."],"answer":0,"explanation":"..."}}]}}. The answer field is the zero-based index 0-3 of the correct option. Do not include Markdown fences or text outside JSON."""
+    try:
+        import requests
+        r=requests.post('https://api.openai.com/v1/responses',headers={'Authorization':f'Bearer {key}','Content-Type':'application/json'},json={'model':os.environ.get('OPENAI_MODEL','gpt-4.1-mini'),'instructions':'You are an accurate school and engineering exam question writer. Never fabricate official syllabus claims. Output the requested JSON only. Check each answer and explanation before returning it.','input':prompt,'max_output_tokens':7000},timeout=90)
+        if r.status_code>=400:
+            app.logger.error('AI quiz provider error %s: %s',r.status_code,r.text[:500])
+            return jsonify(error='The AI provider could not generate the test. Check your API key and API billing in the hosting environment.'),502
+        payload=r.json()
+        output='\n'.join(block.get('text','') for block in payload.get('output',[]) if block.get('type')=='message' for block in block.get('content',[]) if block.get('type')=='output_text')
+        quiz=json.loads(output.strip().removeprefix('```json').removesuffix('```').strip())
+        questions=quiz.get('questions',[])
+        if len(questions)!=15: raise ValueError('Expected exactly 15 questions')
+        cleaned=[]
+        for q in questions:
+            question=str(q.get('question','')).strip()
+            options=q.get('options',[])
+            answer=q.get('answer')
+            explanation=str(q.get('explanation','')).strip()
+            if not question or not isinstance(options,list) or len(options)!=4 or not all(str(x).strip() for x in options) or answer not in [0,1,2,3] or not explanation:
+                raise ValueError('Invalid question structure')
+            cleaned.append({'question':question,'options':[str(x).strip() for x in options],'answer':int(answer),'explanation':explanation})
+        return jsonify(level=level,subject=subject,chapter=chapter,questions=cleaned)
+    except Exception as exc:
+        app.logger.exception('Chapter quiz generation failed: %s',exc)
+        return jsonify(error='Could not create a valid 15-question test. Please try again.'),502
+
 @app.get('/api/admin/summary')
 @login_required
 def admin_summary():
